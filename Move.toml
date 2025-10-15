@@ -1,0 +1,21 @@
+[package]
+name = "faucet"
+version = "1.0.0"
+authors = []
+
+[addresses]
+
+faucet_addr = "0x5ef8afafb7c1e166f8fc622243c82e13644ea3d5634bf63fe4e769b42575b770"
+[dev-addresses]
+
+[dependencies.SupraFramework]
+git = "https://github.com/Entropy-Foundation/aptos-core.git"
+rev = "dev"
+subdir = "aptos-move/framework/supra-framework"
+
+[dependencies.AptosToken]
+git = "https://github.com/Entropy-Foundation/aptos-core.git"
+rev = "dev"
+subdir = "aptos-move/framework/aptos-token"
+
+[dev-dependencies]
