@@ -16,13 +16,15 @@ module faucet_addr::admin_faucet {
     const E_NOT_ADMIN: u64 = 1;
     const E_FAUCET_NOT_INITIALIZED: u64 = 2;
     const E_INSUFFICIENT_FUNDS: u64 = 3;
-    const E_ALREADY_CLAIMED: u64 = 4;
     const E_ASSET_NOT_CONFIGURED: u64 = 5;
     const E_ZERO_DEPOSIT_NOT_ALLOWED: u64 = 6;
-    const E_RATE_LIMIT_EXCEEDED: u64 = 7;
     const E_AMOUNT_BELOW_MINIMUM: u64 = 8;
-    const E_INVALID_DELAY_SETTING: u64 = 9;
     const E_MAX_CLAIMS_REACHED: u64 = 10;
+    const E_USER_MUST_HAVE_ZERO_BALANCE: u64 = 11;
+    const E_COOLDOWN_NOT_ELAPSED: u64 = 12;
+    const E_INVALID_RECOVERY_SETTINGS: u64 = 13;
+    const E_CLAIM_AMOUNT_TOO_LOW: u64 = 14;
+    const E_MIN_AMOUNT_EXCEEDS_MAX: u64 = 15;
 
     const MINIMUM_CLAIM_AMOUNT: u64 = 100;
     const FAUCET_SEED: vector<u8> = b"faucet_resource";
@@ -38,11 +40,14 @@ module faucet_addr::admin_faucet {
         admin_cap: Object<AdminCapability>,
         claim_amounts: Table<TypeInfo, u64>,
         fa_claim_amounts: Table<address, u64>,
+        min_claim_amounts: Table<TypeInfo, u64>,
+        fa_min_claim_amounts: Table<address, u64>,
         max_claims_per_wallet: Table<vector<u8>, u64>,
         deposit_events: EventHandle<DepositEvent>,
         claim_events: EventHandle<ClaimEvent>,
         last_claim_timestamp_micros: u64,
-        claim_delay_micros: u64,
+        recovery_period_micros: u64,
+        global_cooldown_micros: u64,
     }
 
     struct ClaimHistory has key {
@@ -71,7 +76,7 @@ module faucet_addr::admin_faucet {
         move_to(&resource_account_signer, ModuleSignerStorage { signer_cap });
 
         let constructor_ref = object::create_object_from_account(deployer);
-        let object_signer = object::generate_signer(&constructor_ref); 
+        let object_signer = object::generate_signer(&constructor_ref);  
         move_to(&object_signer, AdminCapability {});
         let admin_cap_obj = object::object_from_constructor_ref<AdminCapability>(&constructor_ref);
 
@@ -79,70 +84,116 @@ module faucet_addr::admin_faucet {
             admin_cap: admin_cap_obj,
             claim_amounts: table::new(),
             fa_claim_amounts: table::new(),
+            min_claim_amounts: table::new(),
+            fa_min_claim_amounts: table::new(),
             max_claims_per_wallet: table::new(),
             deposit_events: account::new_event_handle<DepositEvent>(&resource_account_signer),
             claim_events: account::new_event_handle<ClaimEvent>(&resource_account_signer),
             last_claim_timestamp_micros: 0,
-            claim_delay_micros: 1_000_000, 
+            recovery_period_micros: 8220000000,
+            global_cooldown_micros: 1000000,
         });
     }
 
     fun assert_is_admin(addr: address) acquires FaucetStore {
-        let resource_addr = get_resource_account_address(); 
+        let resource_addr = get_resource_account_address();  
         assert!(exists<FaucetStore>(resource_addr), error::not_found(E_FAUCET_NOT_INITIALIZED));
-        let store = borrow_global<FaucetStore>(resource_addr); 
+        let store = borrow_global<FaucetStore>(resource_addr);  
         let admin_cap_owner = object::owner(store.admin_cap);
         assert!(addr == admin_cap_owner, error::permission_denied(E_NOT_ADMIN));
     }
 
     fun get_resource_signer(): signer acquires ModuleSignerStorage {
-        let resource_addr = get_resource_account_address(); 
+        let resource_addr = get_resource_account_address();  
         let signer_cap = &borrow_global<ModuleSignerStorage>(resource_addr).signer_cap;
         account::create_signer_with_capability(signer_cap)
     }
 
+    public entry fun set_global_cooldown(admin: &signer, cooldown_in_seconds: u64) acquires FaucetStore {
+       let addr = signer::address_of(admin);
+       assert_is_admin(addr);
+       let resource_addr = get_resource_account_address();
+       let store = borrow_global_mut<FaucetStore>(resource_addr);
+       store.global_cooldown_micros = cooldown_in_seconds * 1000000;
+    }
+
     // --- Entry Functions ---
-    public entry fun set_claim_delay(admin: &signer, new_delay_micros: u64) acquires FaucetStore {
+    public entry fun set_recovery_period(admin: &signer, period_in_minutes: u64) acquires FaucetStore {
         let addr = signer::address_of(admin);
         assert_is_admin(addr);
-        assert!(new_delay_micros >= 100_000, error::invalid_argument(E_INVALID_DELAY_SETTING));
+        assert!(period_in_minutes > 0, error::invalid_argument(E_INVALID_RECOVERY_SETTINGS));
         let resource_addr = get_resource_account_address();
-        let store = borrow_global_mut<FaucetStore>(resource_addr); 
-        store.claim_delay_micros = new_delay_micros;
+        let store = borrow_global_mut<FaucetStore>(resource_addr);
+        store.recovery_period_micros = period_in_minutes * 60 * 1000000;
     }
 
     public entry fun set_max_claims<AssetType>(admin: &signer, max_claims: u64) acquires FaucetStore {
         let addr = signer::address_of(admin);
         assert_is_admin(addr);
-        let resource_addr = get_resource_account_address(); 
-        let store = borrow_global_mut<FaucetStore>(resource_addr); 
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);  
         let asset_key = bcs::to_bytes(&type_info::type_of<AssetType>());
         table::upsert(&mut store.max_claims_per_wallet, asset_key, max_claims);
     }
 
-    public entry fun set_coin_claim_amount<CoinType>(admin: &signer, amount: u64) acquires FaucetStore {
+    public entry fun set_coin_max_claim_amount<CoinType>(admin: &signer, amount: u64) acquires FaucetStore {
         let addr = signer::address_of(admin);
         assert_is_admin(addr);
         assert!(amount >= MINIMUM_CLAIM_AMOUNT, error::invalid_argument(E_AMOUNT_BELOW_MINIMUM));
-        let resource_addr = get_resource_account_address(); 
-        let store = borrow_global_mut<FaucetStore>(resource_addr); 
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);  
         let type_info = type_info::type_of<CoinType>();
+        if (table::contains(&store.min_claim_amounts, type_info)) {
+            let min_amount = *table::borrow(&store.min_claim_amounts, type_info);
+            assert!(amount >= min_amount, error::invalid_argument(E_MIN_AMOUNT_EXCEEDS_MAX));
+        };
         table::upsert(&mut store.claim_amounts, type_info, amount);
     }
 
-    public entry fun set_fa_claim_amount(admin: &signer, metadata_addr: address, amount: u64) acquires FaucetStore {
+    public entry fun set_coin_min_claim_amount<CoinType>(admin: &signer, amount: u64) acquires FaucetStore {
         let addr = signer::address_of(admin);
         assert_is_admin(addr);
         assert!(amount >= MINIMUM_CLAIM_AMOUNT, error::invalid_argument(E_AMOUNT_BELOW_MINIMUM));
-        let resource_addr = get_resource_account_address(); 
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);  
+        let type_info = type_info::type_of<CoinType>();
+        if (table::contains(&store.claim_amounts, type_info)) {
+            let max_amount = *table::borrow(&store.claim_amounts, type_info);
+            assert!(amount <= max_amount, error::invalid_argument(E_MIN_AMOUNT_EXCEEDS_MAX));
+        };
+        table::upsert(&mut store.min_claim_amounts, type_info, amount);
+    }
+
+    public entry fun set_fa_max_claim_amount(admin: &signer, metadata_addr: address, amount: u64) acquires FaucetStore {
+        let addr = signer::address_of(admin);
+        assert_is_admin(addr);
+        assert!(amount >= MINIMUM_CLAIM_AMOUNT, error::invalid_argument(E_AMOUNT_BELOW_MINIMUM));
+        let resource_addr = get_resource_account_address();  
         let store = borrow_global_mut<FaucetStore>(resource_addr);
+        if (table::contains(&store.fa_min_claim_amounts, metadata_addr)) {
+            let min_amount = *table::borrow(&store.fa_min_claim_amounts, metadata_addr);
+            assert!(amount >= min_amount, error::invalid_argument(E_MIN_AMOUNT_EXCEEDS_MAX));
+        };
         table::upsert(&mut store.fa_claim_amounts, metadata_addr, amount);
+    }
+
+    public entry fun set_fa_min_claim_amount(admin: &signer, metadata_addr: address, amount: u64) acquires FaucetStore {
+        let addr = signer::address_of(admin);
+        assert_is_admin(addr);
+        assert!(amount >= MINIMUM_CLAIM_AMOUNT, error::invalid_argument(E_AMOUNT_BELOW_MINIMUM));
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);
+        if (table::contains(&store.fa_claim_amounts, metadata_addr)) {
+            let max_amount = *table::borrow(&store.fa_claim_amounts, metadata_addr);
+            assert!(amount <= max_amount, error::invalid_argument(E_MIN_AMOUNT_EXCEEDS_MAX));
+        };
+        table::upsert(&mut store.fa_min_claim_amounts, metadata_addr, amount);
     }
 
     public entry fun deposit_coin<CoinType>(account: &signer, amount: u64) acquires FaucetStore, ModuleSignerStorage {
         assert!(amount > 0, error::invalid_argument(E_ZERO_DEPOSIT_NOT_ALLOWED));
-        let resource_addr = get_resource_account_address(); 
-        let store = borrow_global_mut<FaucetStore>(resource_addr); 
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);  
         let type_info = type_info::type_of<CoinType>();
         assert!(table::contains(&store.claim_amounts, type_info), error::not_found(E_ASSET_NOT_CONFIGURED));
         let resource_signer = get_resource_signer();
@@ -161,8 +212,8 @@ module faucet_addr::admin_faucet {
 
     public entry fun deposit_fungible_asset(account: &signer, metadata_addr: address, amount: u64) acquires FaucetStore, ModuleSignerStorage {
         assert!(amount > 0, error::invalid_argument(E_ZERO_DEPOSIT_NOT_ALLOWED));
-        let resource_addr = get_resource_account_address(); 
-        let store = borrow_global_mut<FaucetStore>(resource_addr); 
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);  
         assert!(table::contains(&store.fa_claim_amounts, metadata_addr), error::not_found(E_ASSET_NOT_CONFIGURED));
         let metadata: Object<Metadata> = object::address_to_object<Metadata>(metadata_addr);
         let resource_signer = get_resource_signer();
@@ -181,12 +232,17 @@ module faucet_addr::admin_faucet {
 
     public entry fun claim_coin<CoinType>(user: &signer) acquires FaucetStore, ModuleSignerStorage, ClaimHistory {
         let user_addr = signer::address_of(user);
-        let resource_addr = get_resource_account_address(); 
-        let store = borrow_global_mut<FaucetStore>(resource_addr); 
+        //assert!(coin::balance<CoinType>(user_addr) == 0, error::permission_denied(E_USER_MUST_HAVE_ZERO_BALANCE));
+
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);  
         let current_time_micros = timestamp::now_microseconds();
-        let delay_micros = store.claim_delay_micros;
-        assert!(current_time_micros >= store.last_claim_timestamp_micros + delay_micros, error::aborted(E_RATE_LIMIT_EXCEEDED));
-        store.last_claim_timestamp_micros = current_time_micros;
+
+        assert!(
+            current_time_micros >= store.last_claim_timestamp_micros + store.global_cooldown_micros,
+            error::permission_denied(E_COOLDOWN_NOT_ELAPSED)
+        );
+
         if (!exists<ClaimHistory>(user_addr)) {
             move_to(user, ClaimHistory { claimed_assets: table::new() });
         };
@@ -204,14 +260,49 @@ module faucet_addr::admin_faucet {
             1
         };
         assert!(claims_done < max_claims, error::permission_denied(E_MAX_CLAIMS_REACHED));
+
         assert!(table::contains(&store.claim_amounts, type_info), error::not_found(E_ASSET_NOT_CONFIGURED));
-        let claim_amount = *table::borrow(&store.claim_amounts, type_info);
+        let max_amount = *table::borrow(&store.claim_amounts, type_info);
+        let min_amount = if (table::contains(&store.min_claim_amounts, type_info)) {
+            *table::borrow(&store.min_claim_amounts, type_info)
+        } else {
+            MINIMUM_CLAIM_AMOUNT
+        };
+        let recovery_period = store.recovery_period_micros;
+        let last_claim_time = store.last_claim_timestamp_micros;
+
+        let time_elapsed = if (current_time_micros > last_claim_time) {
+            current_time_micros - last_claim_time
+        } else { 0 };
+
+        let claim_amount: u64;
+        if (time_elapsed >= recovery_period) {
+            claim_amount = max_amount;
+        } else {
+            let time_elapsed_128 = (time_elapsed as u128);
+            let recovery_period_128 = (recovery_period as u128);
+            let max_amount_128 = (max_amount as u128);
+            let min_amount_128 = (min_amount as u128);
+
+            let variable_range_128 = max_amount_128 - min_amount_128;
+            
+            let scaled_variable_amount_128 = if (recovery_period_128 > 0) {
+                let temp = (variable_range_128 * time_elapsed_128) / recovery_period_128;
+                (temp * time_elapsed_128) / recovery_period_128
+            } else { 0 };
+
+            claim_amount = ((min_amount_128 + scaled_variable_amount_128) as u64);
+        };
+        
+        assert!(claim_amount >= MINIMUM_CLAIM_AMOUNT, error::aborted(E_CLAIM_AMOUNT_TOO_LOW));
+
         let resource_signer = get_resource_signer();
         let resource_addr = signer::address_of(&resource_signer);
         assert!(coin::balance<CoinType>(resource_addr) >= claim_amount, error::invalid_state(E_INSUFFICIENT_FUNDS));
         let claimed_coin = coin::withdraw<CoinType>(&resource_signer, claim_amount);
         coin::deposit(user_addr, claimed_coin);
         table::upsert(&mut claim_history.claimed_assets, asset_key, claims_done + 1);
+        store.last_claim_timestamp_micros = current_time_micros;
         event::emit_event(&mut store.claim_events, ClaimEvent {
             claimer: user_addr,
             asset_type: asset_key,
@@ -221,12 +312,15 @@ module faucet_addr::admin_faucet {
 
     public entry fun claim_fungible_asset(user: &signer, metadata_addr: address) acquires FaucetStore, ModuleSignerStorage, ClaimHistory {
         let user_addr = signer::address_of(user);
-        let resource_addr = get_resource_account_address(); 
-        let store = borrow_global_mut<FaucetStore>(resource_addr); 
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global_mut<FaucetStore>(resource_addr);  
         let current_time_micros = timestamp::now_microseconds();
-        let delay_micros = store.claim_delay_micros;
-        assert!(current_time_micros >= store.last_claim_timestamp_micros + delay_micros, error::aborted(E_RATE_LIMIT_EXCEEDED));
-        store.last_claim_timestamp_micros = current_time_micros;
+
+        assert!(
+            current_time_micros >= store.last_claim_timestamp_micros + store.global_cooldown_micros,
+            error::permission_denied(E_COOLDOWN_NOT_ELAPSED)
+        );
+
         if (!exists<ClaimHistory>(user_addr)) {
             move_to(user, ClaimHistory { claimed_assets: table::new() });
         };
@@ -243,14 +337,49 @@ module faucet_addr::admin_faucet {
             1
         };
         assert!(claims_done < max_claims, error::permission_denied(E_MAX_CLAIMS_REACHED));
+
         assert!(table::contains(&store.fa_claim_amounts, metadata_addr), error::not_found(E_ASSET_NOT_CONFIGURED));
-        let claim_amount = *table::borrow(&store.fa_claim_amounts, metadata_addr);
+        let max_amount = *table::borrow(&store.fa_claim_amounts, metadata_addr);
+        let min_amount = if (table::contains(&store.fa_min_claim_amounts, metadata_addr)) {
+            *table::borrow(&store.fa_min_claim_amounts, metadata_addr)
+        } else {
+            MINIMUM_CLAIM_AMOUNT
+        };
+        let recovery_period = store.recovery_period_micros;
+        let last_claim_time = store.last_claim_timestamp_micros;
+
+        let time_elapsed = if (current_time_micros > last_claim_time) {
+            current_time_micros - last_claim_time
+        } else { 0 };
+
+        let claim_amount: u64;
+        if (time_elapsed >= recovery_period) {
+            claim_amount = max_amount;
+        } else {
+            let time_elapsed_128 = (time_elapsed as u128);
+            let recovery_period_128 = (recovery_period as u128);
+            let max_amount_128 = (max_amount as u128);
+            let min_amount_128 = (min_amount as u128);
+
+            let variable_range_128 = max_amount_128 - min_amount_128;
+            
+            let scaled_variable_amount_128 = if (recovery_period_128 > 0) {
+                let temp = (variable_range_128 * time_elapsed_128) / recovery_period_128;
+                (temp * time_elapsed_128) / recovery_period_128
+            } else { 0 };
+            
+            claim_amount = ((min_amount_128 + scaled_variable_amount_128) as u64);
+        };
+        
+        assert!(claim_amount >= MINIMUM_CLAIM_AMOUNT, error::aborted(E_CLAIM_AMOUNT_TOO_LOW));
+
         let metadata = object::address_to_object<Metadata>(metadata_addr);
         let resource_signer = get_resource_signer();
         let resource_addr = signer::address_of(&resource_signer);
         assert!(primary_fungible_store::balance(resource_addr, metadata) >= claim_amount, error::invalid_state(E_INSUFFICIENT_FUNDS));
         primary_fungible_store::transfer(&resource_signer, metadata, user_addr, claim_amount);
         table::upsert(&mut claim_history.claimed_assets, asset_key, claims_done + 1);
+        store.last_claim_timestamp_micros = current_time_micros;
         event::emit_event(&mut store.claim_events, ClaimEvent {
             claimer: user_addr,
             asset_type: asset_key,
@@ -286,14 +415,14 @@ module faucet_addr::admin_faucet {
     }
 
     #[view]
-    public fun get_claim_delay_micros(): u64 acquires FaucetStore {
+    public fun get_recovery_period_micros(): u64 acquires FaucetStore {
         let resource_addr = get_resource_account_address();
-        borrow_global<FaucetStore>(resource_addr).claim_delay_micros 
+        borrow_global<FaucetStore>(resource_addr).recovery_period_micros  
     }
 
     #[view]
-    public fun get_coin_claim_amount<CoinType>(): u64 acquires FaucetStore {
-        let resource_addr = get_resource_account_address(); 
+    public fun get_coin_max_claim_amount<CoinType>(): u64 acquires FaucetStore {
+        let resource_addr = get_resource_account_address();  
         let store = borrow_global<FaucetStore>(resource_addr);
         let type_info = type_info::type_of<CoinType>();
         if (table::contains(&store.claim_amounts, type_info)) {
@@ -304,8 +433,20 @@ module faucet_addr::admin_faucet {
     }
 
     #[view]
-    public fun get_fa_claim_amount(metadata_addr: address): u64 acquires FaucetStore {
-        let resource_addr = get_resource_account_address(); 
+    public fun get_coin_min_claim_amount<CoinType>(): u64 acquires FaucetStore {
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global<FaucetStore>(resource_addr);
+        let type_info = type_info::type_of<CoinType>();
+        if (table::contains(&store.min_claim_amounts, type_info)) {
+            *table::borrow(&store.min_claim_amounts, type_info)
+        } else {
+            0
+        }
+    }
+
+    #[view]
+    public fun get_fa_max_claim_amount(metadata_addr: address): u64 acquires FaucetStore {
+        let resource_addr = get_resource_account_address();  
         let store = borrow_global<FaucetStore>(resource_addr);
         if (table::contains(&store.fa_claim_amounts, metadata_addr)) {
             *table::borrow(&store.fa_claim_amounts, metadata_addr)
@@ -315,9 +456,20 @@ module faucet_addr::admin_faucet {
     }
 
     #[view]
+    public fun get_fa_min_claim_amount(metadata_addr: address): u64 acquires FaucetStore {
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global<FaucetStore>(resource_addr);
+        if (table::contains(&store.fa_min_claim_amounts, metadata_addr)) {
+            *table::borrow(&store.fa_min_claim_amounts, metadata_addr)
+        } else {
+            0
+        }
+    }
+
+    #[view]
     public fun get_max_claims_per_wallet<AssetType>(): u64 acquires FaucetStore {
-        let resource_addr = get_resource_account_address(); 
-        let store = borrow_global<FaucetStore>(resource_addr); 
+        let resource_addr = get_resource_account_address();  
+        let store = borrow_global<FaucetStore>(resource_addr);  
         let asset_key = bcs::to_bytes(&type_info::type_of<AssetType>());
         if (table::contains(&store.max_claims_per_wallet, asset_key)) {
             *table::borrow(&store.max_claims_per_wallet, asset_key)
