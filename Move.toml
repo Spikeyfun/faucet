@@ -5,7 +5,7 @@ authors = []
 
 [addresses]
 
-faucet_addr = "0x5ef8afafb7c1e166f8fc622243c82e13644ea3d5634bf63fe4e769b42575b770"
+faucet_addr = "0x6844ac295a6ddca0987f1812b0792cbae7b5356f109876f14359bd5b6ce57edd"
 [dev-addresses]
 
 [dependencies.SupraFramework]
